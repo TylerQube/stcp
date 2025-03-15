@@ -41,20 +41,35 @@ typedef struct {
 } stcp_send_ctrl_blk;
 /* ADD ANY EXTRA FUNCTIONS HERE */
 
-unsigned char* padded_data(unsigned char* data, int len) {
-    unsigned char* padded = malloc(sizeof(tcpheader) + len);
-    memcpy(padded + sizeof(tcpheader), data, len);
-    return padded;
+void pad_data(unsigned char* buffer, unsigned char* data, int len) {
+    memcpy(buffer + sizeof(tcpheader), data, len);
 }
 
 ssize_t send_packet(stcp_send_ctrl_blk* blk, packet* pkt) {
     pkt->hdr->checksum = 0;
     htonHdr(pkt->hdr);
-    pkt->hdr->checksum = ipchecksum(pkt, STCP_MTU);
+    pkt->hdr->checksum = ipchecksum(pkt, pkt->len);
     long len = payloadSize(pkt);
     logLog("segment", "sending: %d", len);
     logLog("segment", "sending packet of size: %d", pkt->len);
+    dump("s", pkt, pkt->len);
     return send(blk->fd, pkt->data, pkt->len, 0); 
+}
+
+int receive_packet(stcp_send_ctrl_blk* blk, packet* pkt) {
+    int len = readWithTimeout(blk->fd, pkt->hdr, STCP_MAX_TIMEOUT);
+    logLog("segment", "RECEIVE W/ TIMEOUT: %d", len);
+    // save checksum from network order
+    unsigned short checksum = pkt->hdr->checksum;
+    // set checksum to zero before verifying checksum
+    pkt->hdr->checksum = 0;
+    unsigned short actual_cs = ipchecksum(pkt->data, len);
+    if(actual_cs != checksum) {
+        logLog("error", "Checksum 0x%x is not 0x%x", actual_cs, checksum);
+        return -1;
+    }
+    ntohHdr(pkt);
+    return len;
 }
 
 /*
@@ -76,35 +91,41 @@ int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
     if (stcp_CB->state != STCP_SENDER_ESTABLISHED) return STCP_ERROR;
     logLog("segment", "%d bytes to send", length);
 
-    int bytes_sent = 0;
+    int bytes_ack = 0;
     int fd = stcp_CB->fd;
 
-    unsigned char* packet_data;
+    unsigned char* packet_data = malloc(STCP_MTU);
     packet *pkt = stcp_CB->pkt;
-    while(bytes_sent < length) {
-        packet_data = padded_data(data, length); 
+    int fail_ack = 1;
+    while(bytes_ack < length) {
+        pad_data(packet_data, data, length); 
         createSegment(pkt, ACK, stcp_CB->window_size, pkt->hdr->ackNo, pkt->hdr->seqNo+1, packet_data, length);
+        int seqNo = pkt->hdr->seqNo;
         int s = send_packet(stcp_CB, pkt);
-        logLog("segment", "sent: %d", s);
-        free(packet_data);
-        bytes_sent += s;
-
-        int len = readWithTimeout(fd, pkt->hdr, STCP_MAX_TIMEOUT);
-        // save checksum from network order
-        unsigned short checksum = pkt->hdr->checksum;
-        // set checksum to zero before verifying checksum
-        pkt->hdr->checksum = 0;
-        unsigned short actual_cs = ipchecksum(pkt->hdr, len);
-        if(actual_cs != checksum) {
-            logLog("error", "Checksum 0x%x is not 0x%x", actual_cs, checksum);
-            return NULL;
+        logLog("segment", "data length: %d", length);
+        logLog("segment", "sent %d bytes w/ packet length %d", s, pkt->len);
+        if(s != pkt->len) {
+            logLog("segment", "%d != %d failed, looping", s, pkt->len);
+            continue;
         }
 
+        logLog("segment", "%p", packet_data);
+
+        int r = receive_packet(stcp_CB, pkt);
+        logLog("segment", "received %d bytes", r);
+        if(r == -1) continue;
+        int bytes_r = pkt->hdr->ackNo - seqNo;
+        logLog("segment", "receiving ACK: %d", bytes_r);
+        if(bytes_r == -1) continue;
+
+
+        bytes_ack += bytes_r;
     }
 
-    ntohHdr(pkt->hdr);
+    // free(packet_data);
 
 
+    logLog("segment", "sent buffer!");
     return STCP_SUCCESS;
 }
 
@@ -125,6 +146,10 @@ int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
  * very good for a pure request response protocol like DNS where there
  * is no long term relationship between the client and server.
  */
+
+// handle window HERE in stcp_open
+// linked-list of in-flight packets
+// free/increment past all ACK'd based on ACK num of ack packet
 stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
                              int receiversPort) {
 
@@ -132,7 +157,6 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
     // Since I am the sender, the destination and receiversPort name the other side
     int fd = udp_open(destination, receiversPort, sendersPort);
     (void) fd;
-    /* YOUR CODE HERE */
 
     unsigned short checksum;
     ssize_t s;
@@ -144,11 +168,7 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
     packet* pkt = malloc(STCP_MTU);
     blk->pkt = pkt;
     createSegment(pkt, SYN, STCP_MAXWIN, 0, 0, NULL, 0);
-    pkt->hdr->checksum = 0;
-    htonHdr(pkt->hdr);
-    pkt->hdr->checksum = ipchecksum(pkt->hdr, STCP_MTU);
-    s = send(fd, pkt, pkt->len, 0); 
-    logLog("segment", "%d", s);
+    s = send_packet(blk, pkt);
 
     blk->state = STCP_SENDER_SYN_SENT;
 
@@ -156,42 +176,22 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
     logLog("segment", "sent SYN");
 
     // Receive SYN-ACK
-    int len = readWithTimeout(fd, pkt->hdr, STCP_MAX_TIMEOUT);
-    // save checksum from network order
-    checksum = pkt->hdr->checksum;
-    // set checksum to zero before verifying checksum
-    pkt->hdr->checksum = 0;
-    unsigned short actual_cs = ipchecksum(pkt->hdr, len);
-    if(actual_cs != checksum) {
-        logLog("error", "Checksum 0x%x is not 0x%x", actual_cs, checksum);
+    int len = receive_packet(blk, pkt);
+    if(len == -1) {
         return NULL;
     }
 
     blk->state = STCP_SENDER_ESTABLISHED;
 
-    ntohHdr(pkt->hdr);
 
     createSegment(pkt, ACK, pkt->hdr->windowSize, pkt->hdr->ackNo, pkt->hdr->seqNo+1, NULL, 0);
-    pkt->hdr->checksum = 0;
-    htonHdr(pkt->hdr);
-    pkt->hdr->checksum = ipchecksum(pkt->hdr, sizeof(tcpheader));
-    s = send(fd, pkt, pkt->len, 0); 
-    logLog("segment", "%d", s);
+    s = send_packet(blk, pkt);
 
     // Receive ACK 
-    len = readWithTimeout(fd, pkt->hdr, STCP_MAX_TIMEOUT);
-    // save checksum from network order
-    checksum = pkt->hdr->checksum;
-    // set checksum to zero before verifying checksum
-    pkt->hdr->checksum = 0;
-    actual_cs = ipchecksum(pkt->hdr, len);
-    if(actual_cs != checksum) {
-        logLog("error", "Checksum 0x%x is not 0x%x", actual_cs, checksum);
+    len = receive_packet(blk, pkt);
+    if(len == -1) {
         return NULL;
     }
-
-    ntohHdr(pkt->hdr);
-
 
     return blk;
 }
@@ -211,26 +211,17 @@ int stcp_close(stcp_send_ctrl_blk *cb) {
     packet *pkt = cb->pkt;
     int fd = cb->fd;
     createSegment(pkt, FIN, cb->window_size, pkt->hdr->ackNo, pkt->hdr->seqNo+1, NULL, 0);
-    pkt->hdr->checksum = 0;
-    htonHdr(pkt->hdr);
-    pkt->hdr->checksum = ipchecksum(pkt, STCP_MTU);
-    int s = send(fd, pkt, STCP_MTU, 0); 
+    int s = send_packet(cb, pkt);
 
     cb->state = STCP_SENDER_FIN_WAIT;
 
-    int len = readWithTimeout(fd, pkt->hdr, STCP_MAX_TIMEOUT);
-    // save checksum from network order
-    unsigned short checksum = pkt->hdr->checksum;
-    // set checksum to zero before verifying checksum
-    pkt->hdr->checksum = 0;
-    unsigned short actual_cs = ipchecksum(pkt->hdr, len);
-    if(actual_cs != checksum) {
-        logLog("error", "Checksum 0x%x is not 0x%x", actual_cs, checksum);
+    int len = receive_packet(cb, pkt);
+    if(len == -1) {
         return NULL;
     }
 
+
     cb->state = STCP_SENDER_CLOSED;
-    /* YOUR CODE HERE */
     return STCP_SUCCESS;
 }
 /*
@@ -310,11 +301,13 @@ int main(int argc, char **argv) {
         if (num_read_bytes <= 0)
             break;
 
+        logLog("segment", "sending %d BYTES NOW", num_read_bytes);
         if (stcp_send(cb, buffer, num_read_bytes) == STCP_ERROR) {
             exit(1);
             /* YOUR CODE HERE */
         }
     }
+    logLog("segment", "all bytes sent");
 
     /* Close the connection to remote receiver */
     if (stcp_close(cb) == STCP_ERROR) {
